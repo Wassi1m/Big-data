@@ -7,6 +7,7 @@ ES=${ES:-http://localhost:9200}
 curl -s -X PUT "$ES/_index_template/uber-geo" -H 'Content-Type: application/json' -d '{
   "index_patterns": ["taxi-locations-*", "client-requests-*", "zone-stats"],
   "template": {
+    "settings": { "number_of_replicas": 0 },
     "mappings": {
       "properties": {
         "location":         { "type": "geo_point" },
