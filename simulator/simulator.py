@@ -1,6 +1,17 @@
-"""Simulateur temps reel de taxis et clients (style Uber / Bolt) sur Tunis."""
-import argparse, json, math, random, time, uuid
+"""
+Simulateur temps reel de taxis et clients (style Uber / Bolt) sur Tunis.
+Envoie les positions dans Kafka :
+  - topic "taxi-locations"  : position + statut de chaque taxi
+  - topic "client-requests" : demandes de course et leur statut
+"""
+import argparse
+import json
+import math
+import random
+import time
+import uuid
 from datetime import datetime, timezone
+
 from kafka import KafkaProducer
 
 ZONES = {
@@ -12,27 +23,33 @@ ZONES = {
     "Ben Arous": (36.7530, 10.2280),
 }
 FIRST_NAMES = ["Ali", "Sami", "Mehdi", "Yassine", "Karim", "Omar", "Amine", "Nizar", "Hedi", "Walid"]
-MAX_WAIT_S = 90
+MAX_WAIT_S = 90  # un client annule apres 90 s sans taxi
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
 
 def random_point(zone=None):
     zone = zone or random.choice(list(ZONES))
     lat, lon = ZONES[zone]
     return lat + random.gauss(0, 0.008), lon + random.gauss(0, 0.008)
 
+
 def zone_of(lat, lon):
     return min(ZONES, key=lambda z: (ZONES[z][0] - lat) ** 2 + (ZONES[z][1] - lon) ** 2)
 
+
 def distance_km(lat1, lon1, lat2, lon2):
+    r = 6371
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp, dl = p2 - p1, math.radians(lon2 - lon1)
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * 6371 * math.asin(math.sqrt(a))
+    return 2 * r * math.asin(math.sqrt(a))
+
 
 def move_towards(obj, target, speed_kmh, tick_s):
+    """Deplace obj vers target. Retourne True si arrive."""
     step = speed_kmh * tick_s / 3600
     dist = distance_km(obj["lat"], obj["lon"], *target)
     if dist <= step:
@@ -43,47 +60,72 @@ def move_towards(obj, target, speed_kmh, tick_s):
     obj["lon"] += (target[1] - obj["lon"]) * f
     return False
 
+
 def make_taxi(i):
     lat, lon = random_point()
-    return {"taxi_id": f"TX-{i:03d}", "driver": random.choice(FIRST_NAMES),
-            "lat": lat, "lon": lon, "status": "available",
-            "speed_kmh": random.uniform(25, 45), "target": random_point(), "request_id": None}
+    return {
+        "taxi_id": f"TX-{i:03d}",
+        "driver": random.choice(FIRST_NAMES),
+        "lat": lat, "lon": lon,
+        "status": "available",          # available | to_pickup | on_trip
+        "speed_kmh": random.uniform(25, 45),
+        "target": random_point(),
+        "request_id": None,
+    }
+
 
 def make_client():
-    pickup, dropoff = random_point(), random_point()
-    return {"request_id": str(uuid.uuid4())[:8], "client_id": f"CL-{random.randint(1, 9999):04d}",
-            "pickup": pickup, "dropoff": dropoff, "lat": pickup[0], "lon": pickup[1],
-            "status": "waiting", "taxi_id": None, "created": time.time()}
+    pickup = random_point()
+    dropoff = random_point()
+    return {
+        "request_id": str(uuid.uuid4())[:8],
+        "client_id": f"CL-{random.randint(1, 9999):04d}",
+        "pickup": pickup, "dropoff": dropoff,
+        "lat": pickup[0], "lon": pickup[1],
+        "status": "waiting",            # waiting | assigned | picked_up | completed | cancelled
+        "taxi_id": None,
+        "created": time.time(),
+    }
+
 
 def taxi_event(t):
-    return {"taxi_id": t["taxi_id"], "driver": t["driver"],
-            "lat": round(t["lat"], 6), "lon": round(t["lon"], 6),
-            "status": t["status"], "speed_kmh": round(t["speed_kmh"], 1),
-            "zone": zone_of(t["lat"], t["lon"]), "request_id": t["request_id"],
-            "timestamp": now_iso()}
+    return {
+        "taxi_id": t["taxi_id"], "driver": t["driver"],
+        "lat": round(t["lat"], 6), "lon": round(t["lon"], 6),
+        "status": t["status"], "speed_kmh": round(t["speed_kmh"], 1),
+        "zone": zone_of(t["lat"], t["lon"]),
+        "request_id": t["request_id"],
+        "timestamp": now_iso(),
+    }
+
 
 def client_event(c):
-    return {"request_id": c["request_id"], "client_id": c["client_id"],
-            "lat": round(c["lat"], 6), "lon": round(c["lon"], 6),
-            "pickup_lat": round(c["pickup"][0], 6), "pickup_lon": round(c["pickup"][1], 6),
-            "dropoff_lat": round(c["dropoff"][0], 6), "dropoff_lon": round(c["dropoff"][1], 6),
-            "status": c["status"], "taxi_id": c["taxi_id"], "zone": zone_of(*c["pickup"]),
-            "trip_km": round(distance_km(*c["pickup"], *c["dropoff"]), 2),
-            "timestamp": now_iso()}
+    return {
+        "request_id": c["request_id"], "client_id": c["client_id"],
+        "lat": round(c["lat"], 6), "lon": round(c["lon"], 6),
+        "pickup_lat": round(c["pickup"][0], 6), "pickup_lon": round(c["pickup"][1], 6),
+        "dropoff_lat": round(c["dropoff"][0], 6), "dropoff_lon": round(c["dropoff"][1], 6),
+        "status": c["status"], "taxi_id": c["taxi_id"],
+        "zone": zone_of(*c["pickup"]),
+        "trip_km": round(distance_km(*c["pickup"], *c["dropoff"]), 2),
+        "timestamp": now_iso(),
+    }
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bootstrap", default="localhost:9092")
     ap.add_argument("--taxis", type=int, default=40)
-    ap.add_argument("--spawn", type=float, default=0.4)
-    ap.add_argument("--tick", type=float, default=1.0)
-    ap.add_argument("--speedup", type=float, default=10.0)
+    ap.add_argument("--spawn", type=float, default=0.4, help="probabilite d'un nouveau client par tick")
+    ap.add_argument("--tick", type=float, default=1.0, help="secondes entre deux envois")
+    ap.add_argument("--speedup", type=float, default=10.0, help="acceleration du temps simule")
     args = ap.parse_args()
 
-    producer = KafkaProducer(bootstrap_servers=args.bootstrap,
-                             value_serializer=lambda v: json.dumps(v).encode(),
-                             key_serializer=lambda k: k.encode())
+    producer = KafkaProducer(
+        bootstrap_servers=args.bootstrap,
+        value_serializer=lambda v: json.dumps(v).encode(),
+        key_serializer=lambda k: k.encode(),
+    )
     taxis = [make_taxi(i + 1) for i in range(args.taxis)]
     clients = {}
     sim_tick = args.tick * args.speedup
@@ -95,7 +137,7 @@ def main():
             c = make_client()
             clients[c["request_id"]] = c
 
-        # 2. Dispatch : taxi libre le plus proche
+        # 2. Dispatch : taxi disponible le plus proche
         free = [t for t in taxis if t["status"] == "available"]
         for c in clients.values():
             if c["status"] != "waiting" or not free:
