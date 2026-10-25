@@ -31,7 +31,7 @@ def now_iso():
 
 
 def random_point(zone=None):
-    zone = zone or random.choice(list(ZONES))
+    zone = zone or random.choices(list(ZONES), weights=[35, 25, 15, 10, 8, 7])[0]
     lat, lon = ZONES[zone]
     return lat + random.gauss(0, 0.008), lon + random.gauss(0, 0.008)
 
